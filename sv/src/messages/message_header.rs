@@ -98,14 +98,10 @@ impl Serializable<MessageHeader> for MessageHeader {
 // Prints so the command is easier to read
 impl fmt::Debug for MessageHeader {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let command = match str::from_utf8(&self.command) {
-            Ok(s) => s.to_string(),
-            Err(_) => format!("Not Ascii ({:?})", self.command),
-        };
         write!(
             f,
             "Header {{ magic: {:?}, command: {:?}, payload_size: {}, checksum: {:?} }}",
-            self.magic, command, self.payload_size, self.checksum
+            self.magic, self.get_command(), self.payload_size, self.checksum
         )
     }
 }

@@ -33,24 +33,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt};
 use tokio_byteorder::{LittleEndian, AsyncWriteBytesExt, AsyncReadBytesExt};
+use std::collections::HashSet;
 
 macro_rules! read_varint_num {
     ($e:expr) => {  
         {
-            let first = AsyncReadBytesExt::read_u8($e).await.unwrap();
+            let first = AsyncReadBytesExt::read_u8($e).await?;
             match first {
                 0xFD => {
-                    let n = AsyncReadBytesExt::read_u16::<LittleEndian>($e).await.unwrap();
+                    let n = AsyncReadBytesExt::read_u16::<LittleEndian>($e).await?;
                     n as u64
                 },
 
                 0xFE => {
-                    let n = AsyncReadBytesExt::read_u32::<LittleEndian>($e).await.unwrap();
+                    let n = AsyncReadBytesExt::read_u32::<LittleEndian>($e).await?;
                     n as u64
                 },
 
                 0xFF => {
-                    AsyncReadBytesExt::read_u64::<LittleEndian>($e).await.unwrap()
+                    AsyncReadBytesExt::read_u64::<LittleEndian>($e).await?
                 },
 
                 _ => {
@@ -78,13 +79,17 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub async fn connect(addr: &str) -> Result<Peer, Box<dyn Error>> {
+
+    pub async fn connect<A: tokio::net::ToSocketAddrs>(addr: A, addrs: HashSet<String>) -> Result<Peer, Box<dyn Error>> {
+        let dir = std::env::current_dir().unwrap();
+        println!("current dir = {:?}", dir.to_str().unwrap());
+
         let mut stream = TcpStream::connect(addr).await?;
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (mut tx, mut rx) = unbounded_channel::<PeerMessage>();
 
         let peer = Peer {
-            addr: addr.into(),
+            addr: "addr".to_owned(),
             runing: Arc::new(AtomicBool::new(true)),
         };
 
@@ -95,7 +100,15 @@ impl Peer {
 
         tokio::spawn(Self::start_ping_task(peer.runing.clone(), tx.clone()));
 
-        tokio::spawn(Self::run(peer.runing.clone(), tx, reader));
+        let running = peer.runing.clone();
+        tokio::spawn(async move {
+            match Self::run(running, tx, reader, addrs).await {
+                Ok(_) => {},
+                Err(err) => {
+                    println!("peer running error {:?}", err);
+                }
+            }
+        });
 
         Ok(peer)
     }
@@ -135,7 +148,7 @@ impl Peer {
         }
     }
 
-    async fn run(runing: Arc<AtomicBool>, mut tx: UnboundedSender<PeerMessage>, mut reader: ReadHalf<TcpStream>) {
+    async fn run(runing: Arc<AtomicBool>, tx: UnboundedSender<PeerMessage>, mut reader: ReadHalf<TcpStream>, addrs: HashSet<String>) -> Result<(), Box<dyn Error>>  {
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
@@ -154,16 +167,17 @@ impl Peer {
                 port: 0,
             },
             nonce: 1787878,
-            user_agent: "/rust.sv:12.0 by tj".into(),
+            user_agent: "/Bitcoin SV:1.0.2/".into(),
             start_height: 0,
             relay: true,
         };
+
         tx.send(PeerMessage::Message(Message::Version(version)));
 
         loop {
             let mut header = [0; 24];
 
-            reader.read_exact(&mut header).await;
+            let n = reader.read_exact(&mut header).await?;
 
             let mut rdr = Cursor::new(&header);
 
@@ -173,18 +187,17 @@ impl Peer {
 
             rdr.read(&mut header.magic).await;
             rdr.read(&mut header.command).await;
-            header.payload_size = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut rdr).await.unwrap();
+            header.payload_size = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut rdr).await?;
             rdr.read(&mut header.checksum).await;
 
-            println!("read header {:?}", header);
+            // println!("read header {:?}", header);
 
             // header.command
             let command = header.get_command();
-            println!("command is {}", command);
+            // println!("command is {}", command);
 
             let payload_size = header.payload_size as usize;
 
-            println!("command is block ? {}", command == "block");
 
             if command == "block" {
                 println!("start reading block");
@@ -194,13 +207,13 @@ impl Peer {
                 let mut rdr = Cursor::new(&header[..]);
 
                 let block_header = BlockHeader::from_buf(&header).unwrap();
-                println!("block header = {:?}", block_header);
+                println!("[begin] block header = {:?}", block_header);
 
 
                 let tx_count = read_varint_num!(&mut reader);
                 
                 for i in 0..tx_count {
-                    let version = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+                    let version = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await?;
 
                     let txin_count = read_varint_num!(&mut reader);
                     // println!("txin_count = {:?}", txin_count);
@@ -209,16 +222,16 @@ impl Peer {
 
                     for i in 0..txin_count {
                         let mut prev_txid = [0; 32];
-                        reader.read_exact(&mut prev_txid).await.unwrap();
+                        reader.read_exact(&mut prev_txid).await?;
 
-                        let output_index = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+                        let output_index = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await?;
 
                         let len = read_varint_num!(&mut reader);
 
                         let mut buffer = vec![0; len as usize];
-                        reader.read_exact(buffer.as_mut_slice()).await.unwrap();
+                        reader.read_exact(buffer.as_mut_slice()).await?;
 
-                        let sequence_number = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+                        let sequence_number = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await?;
 
                         tx_in.push(
                             TxIn {
@@ -238,14 +251,14 @@ impl Peer {
                     let mut tx_out = vec![];
 
                     for j in 0..txout_count {
-                        let satoshis = AsyncReadBytesExt::read_u64::<LittleEndian>(&mut reader).await.unwrap();
+                        let satoshis = AsyncReadBytesExt::read_u64::<LittleEndian>(&mut reader).await?;
 
                         let len = read_varint_num!(&mut reader);
                         let mut script = Script::new();
 
                         if len > 0 {
                             let mut buffer = vec![0; len as usize];
-                            reader.read_exact(buffer.as_mut_slice()).await.unwrap();
+                            reader.read_exact(buffer.as_mut_slice()).await?;
                             script = Script(buffer);
                         }
 
@@ -255,7 +268,7 @@ impl Peer {
                         });
                     }
 
-                    let lock_time = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+                    let lock_time = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await?;
                     let tx = Tx {
                         version,
                         inputs: tx_in,
@@ -263,22 +276,7 @@ impl Peer {
                         lock_time: lock_time,
                     };
 
-                    println!("tx = {:?}", tx);
-                }
-                continue;
-            }
-
-            let mut buffer = vec![0; payload_size];
-            reader.read_exact(buffer.as_mut_slice()).await;
-
-            let mut rdr = Cursor::new(&buffer);
-            let message = Message::read_partial(&mut rdr, &header);
-            // println!("{:?}", message);
-
-            match message {
-                Ok(Message::Tx(tx)) => {
-                    // println!("transaction {:?}", tx.hash());
-                    let outputs = tx.outputs;
+                    let outputs = &tx.outputs;
                     for output in outputs {
                         let amount = output.amount;
 
@@ -289,7 +287,46 @@ impl Peer {
                         match extract_pubkeyhash(&output.pk_script.0) {
                             Ok(ref hash160) => {
                                 let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
-                                // println!("address = {}, amount = {:?}", address, amount);
+                                if addrs.contains(&address) {
+                                    println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                }
+                                println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                            },
+                            Err(err) => {
+
+                            }
+                        }
+                    }
+                }
+                println!("[end] block header = {:?}", block_header);
+                continue;
+            }
+
+            let mut buffer = vec![0; payload_size];
+            reader.read_exact(buffer.as_mut_slice()).await?;
+
+            let mut rdr = Cursor::new(&buffer);
+            let message = Message::read_partial(&mut rdr, &header);
+            // println!("{:?}", message);
+
+            match message {
+                Ok(Message::Tx(ref tx)) => {
+                    // println!("transaction {:?}", tx.hash());
+                    let outputs = &tx.outputs;
+                    for output in outputs {
+                        let amount = output.amount;
+
+                        if amount.0 == 0 {
+                            continue;
+                        }
+
+                        match extract_pubkeyhash(&output.pk_script.0) {
+                            Ok(ref hash160) => {
+                                let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
+                                if addrs.contains(&address) {
+                                    println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                }
+                                println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                             },
                             Err(err) => {
 
@@ -312,7 +349,7 @@ impl Peer {
                         hash: Hash256::decode("00000000000000000431fe7834b59fd4ff5a296db88944f4a8f2e3e6761465d6").unwrap(),
                     });
 
-                    tx.send(PeerMessage::Message(Message::GetData(inv)));
+                    // tx.send(PeerMessage::Message(Message::GetData(inv)));
 
                     // let locator = BlockLocator {
                     //     version: 70015,
@@ -355,7 +392,7 @@ impl Peer {
 
                 Ok(Message::Verack) => {
                     // request Mempool transactions
-                    // tx.send(Message::Mempool);
+                    // tx.send(PeerMessage::Message(Message::Mempool));
                     tx.send(PeerMessage::Message(Message::GetAddr));
                 },
 
@@ -367,8 +404,16 @@ impl Peer {
                     tx.send(PeerMessage::Message(Message::Pong(ping)));
                 },
 
-                _ => {
+                Ok(Message::Addr(addr)) => {
+                    println!("get a addr message {:?}", addr);
+                    let addrs = addr.addrs;
+                    for address in addrs {
+                        println!("get a address message {:?}", address);
+                    }
+                }
 
+                _ => {
+                    println!("get a message {:?}", message);
                 }
             };
         }

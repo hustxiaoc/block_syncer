@@ -29,6 +29,10 @@ use std::thread;
 use tokio::fs::File;
 use tokio::io::{self, AsyncReadExt};
 use tokio_byteorder::{LittleEndian, AsyncWriteBytesExt, AsyncReadBytesExt};
+use std::collections::HashSet;
+use dns_lookup::{lookup_host, lookup_addr};
+use serde_derive::Deserialize;
+use toml;
 
 mod peer;
 
@@ -60,9 +64,26 @@ macro_rules! read_varint_num {
     };
 }
 
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    global_string: Option<String>,
+    global_integer: Option<u64>,
+    redis: Option<RedisConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedisConfig {
+    ip: Option<String>,
+    port: Option<u64>,
+}
+
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {     
-    let mut f = File::open("/Users/taoxiaojie/Library/Application Support/Bitcoin/blocks/blk00027.dat").await?;
+async fn main() -> Result<(), Box<dyn Error>> {   
+    
+
+    // let mut f = File::open("/Users/taoxiaojie/Library/Application Support/Bitcoin/blocks/blk00027.dat").await?;
 
     // loop {
     //     let magic = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
@@ -155,25 +176,103 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //     // println!("tx_count = {:?}", tx_count);
     // }
        
-    // peer::Peer::connect("178.62.228.194:8333").await?;
     //
-    peer::Peer::connect("178.128.147.160:8333").await?;
+    let dir = std::env::current_dir().unwrap();
+    let file_path = dir.join("address.txt");
+    let config_file = dir.join("config.toml");
+    
+    {
+        let mut f = File::open(config_file).await?;
+        let mut contents = String::new();
+        f.read_to_string(&mut contents).await?;
+        let decoded: Config = toml::from_str(&contents).unwrap();
+        // println!("{:#?}", decoded);
+    }
+    
+    let mut f = File::open(file_path).await?;
+    
+    let mut contents = String::new();
+    f.read_to_string(&mut contents).await?;
+
+    println!("current dir = {:?}", dir.to_str().unwrap());
+
+    let list:Vec<&str> = contents.split("\n").collect();
+    let mut addrs = HashSet::new();
+    for item in list {
+        if item.trim().len() > 0 {
+            addrs.insert(item.to_owned());
+        }
+    }
+
+    let seeds = vec![
+        "seed.bitcoinsv.io", 
+        "seed.bitprim.org",
+        "seed.deadalnix.me",   
+        "seeder.criptolayer.net",
+    ];
+
+    let mut ips: Vec<std::net::IpAddr> = vec![];
+
+    for hostname in seeds {
+        match lookup_host(hostname) {
+            Ok(list) => {
+                ips = list; 
+                break;
+            },
+            Err(err) => {
+                println!("lookup_host {} occurs error {:?}", hostname, err);
+            }
+        };
+    }
+
+    let addr_map = Arc::new(Mutex::new(addrs));
+
+    let addr_map_clone = addr_map.clone();
+    tokio::spawn( async move  {
+        use redis::{self, AsyncCommands};
+        loop {
+            let client = redis::Client::open("redis://127.0.0.1:6379/").expect("can not connect to redis server!");
+            let mut con = client.get_async_connection().await.unwrap();
+            println!("connected to redis server");
+            loop {
+                match con.brpop::<&str, (String, String)>("list_1", 0).await {
+                    Ok((k, v)) => {
+                        println!("value is {:?}", v);
+                        let mut lock = addr_map_clone.lock().await;
+                        (*lock).insert(v);
+                    },
+                    Err(err) => {
+                        println!("redis brpop error {:?}", err);
+                        tokio::time::delay_for(std::time::Duration::from_secs(3)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    for ip in ips {
+        let addr = std::net::SocketAddr::new(ip, 8333);
+        println!("ips = {:?}", addr);
+        let addrs = addr_map.clone();
+        tokio::spawn(async move {
+            // match peer::Peer::connect(addr, addrs).await {
+            //     Err(err) => {
+            //         println!("connect {} occurs error {:?}", addr, err);
+            //     },
+            //     _ => {
+
+            //     }
+            // }            
+        });
+    }
+    
+   
+    // peer::Peer::connect("178.62.228.194:8333", addrs).await?;
+
+    // peer::Peer::connect("178.128.147.160:8333", addrs).await?;
     //
 
-    let xx = "block";
-    let mut b = *b"block\0\0\0\0\0\0";
-    println!("command = |{:?}|", b.to_vec());
-
-    let new = b.to_vec().iter().filter(|&c| {
-        *c > 0
-    }).map(|x| *x).collect::<Vec<u8>>();
-
-    let s = std::str::from_utf8(new.as_ref()).unwrap().trim();
-
-    println!("command = |{:?}|", s.as_bytes());
-    println!("block = |{:?}|", xx.as_bytes());
-
-    println!("s == block ? {}", s == "block");
     loop {
         delay_for(Duration::from_millis(1000 * 30)).await;
         println!("delay runing");
