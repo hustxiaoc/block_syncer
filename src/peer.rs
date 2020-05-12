@@ -5,14 +5,24 @@ use tokio::time::delay_for;
 use tokio::time::{timeout, Duration};
 use tokio::io::{ReadHalf, WriteHalf};
 
-use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
+// use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::Ipv6Addr;
 use sv::messages::{
     Ping,
+    Inv,
+    BlockHeader,
+    BlockLocator,
+    NO_HASH_STOP,
+    TxIn, TxOut, Tx, OutPoint,
+    INV_VECT_BLOCK, InvVect,
     Version, NodeAddr, Message, MessageHeader
 };
+use sv::script::Script;
+use sv::util::{Hash256, Amount};
+use sv::address::{addr_encode, AddressType};
+use sv::transaction::p2pkh::{extract_pubkeyhash};
 use sv::network::Network;
 use cryptoxide::{
     digest::Digest,
@@ -21,6 +31,35 @@ use cryptoxide::{
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::{self, AsyncReadExt};
+use tokio_byteorder::{LittleEndian, AsyncWriteBytesExt, AsyncReadBytesExt};
+
+macro_rules! read_varint_num {
+    ($e:expr) => {  
+        {
+            let first = AsyncReadBytesExt::read_u8($e).await.unwrap();
+            match first {
+                0xFD => {
+                    let n = AsyncReadBytesExt::read_u16::<LittleEndian>($e).await.unwrap();
+                    n as u64
+                },
+
+                0xFE => {
+                    let n = AsyncReadBytesExt::read_u32::<LittleEndian>($e).await.unwrap();
+                    n as u64
+                },
+
+                0xFF => {
+                    AsyncReadBytesExt::read_u64::<LittleEndian>($e).await.unwrap()
+                },
+
+                _ => {
+                    first as u64
+                }
+            }
+        }
+    };
+}
 
 enum PeerMessage {
     Message(Message),
@@ -121,92 +160,217 @@ impl Peer {
         };
         tx.send(PeerMessage::Message(Message::Version(version)));
 
-        let mut buf = [0; 10240];
-        let mut read_buf: Vec<u8> = vec![];
-
-        let mut header_read = false;
-        let mut message_header: Option<MessageHeader> = None;
-
         loop {
-            println!("start reading");
-            let n = match reader.read(&mut buf).await {
-                Ok(n) if n== 0 => {
-                    println!("no data");
-                    break;
-                },
-                Ok(n) => n,
-                Err(e) => {
-                    tx.send(PeerMessage::Stop);
-                    runing.store(false, Ordering::Relaxed);
-                    eprintln!("failed to read from socket; err = {:?}", e);
-                    break;
-                }
+            let mut header = [0; 24];
+
+            reader.read_exact(&mut header).await;
+
+            let mut rdr = Cursor::new(&header);
+
+            let mut header = MessageHeader {
+                ..Default::default()
             };
 
-            println!("read {} bytes.", n);
-            read_buf.extend(&buf[0..n]);
+            rdr.read(&mut header.magic).await;
+            rdr.read(&mut header.command).await;
+            header.payload_size = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut rdr).await.unwrap();
+            rdr.read(&mut header.checksum).await;
 
-            if header_read == false {
+            println!("read header {:?}", header);
 
-                if read_buf.len() < 24 {
-                    continue;
-                }
+            // header.command
+            let command = header.get_command();
+            println!("command is {}", command);
 
-                let mut rdr = Cursor::new(&read_buf[0..24]);
+            let payload_size = header.payload_size as usize;
 
-                let mut header = MessageHeader {
-                    ..Default::default()
-                };
+            println!("command is block ? {}", command == "block");
 
-                rdr.read(&mut header.magic).await;
-                rdr.read(&mut header.command).await;
-                header.payload_size = ReadBytesExt::read_u32::<LittleEndian>(&mut rdr).unwrap();
-                rdr.read(&mut header.checksum).await;
+            if command == "block" {
+                println!("start reading block");
+                let mut header = [0; 80];
+                reader.read_exact(&mut header).await;
 
-                println!("read header {:?}", header);
-                message_header = Some(header);
+                let mut rdr = Cursor::new(&header[..]);
 
-                header_read = true;
-                read_buf = read_buf[24..].to_vec();
-            }
+                let block_header = BlockHeader::from_buf(&header).unwrap();
+                println!("block header = {:?}", block_header);
 
-            if header_read == true {
-                let header = message_header.as_ref().unwrap();
-                let payload_size = header.payload_size as usize;
-                if read_buf.len() < payload_size {
-                    continue;
-                }
 
-                let mut rdr = Cursor::new(&read_buf[0..payload_size]);
-                let message = Message::read_partial(&mut rdr, &header);
-                header_read = false;
-                println!("{:?}", message);
-                read_buf = read_buf[payload_size..].to_vec();
+                let tx_count = read_varint_num!(&mut reader);
+                
+                for i in 0..tx_count {
+                    let version = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
 
-                match message {
-                    Ok(Message::Version(v)) => {
-                        tx.send(PeerMessage::Message(Message::Verack));
-                    },
+                    let txin_count = read_varint_num!(&mut reader);
+                    // println!("txin_count = {:?}", txin_count);
 
-                    Ok(Message::Verack) => {
-                        // request Mempool transactions
-                        // tx.send(Message::Mempool);
-                        tx.send(PeerMessage::Message(Message::GetAddr));
-                    },
+                    let mut tx_in = vec![];
 
-                    Ok(Message::Inv(inv)) => {
-                        tx.send(PeerMessage::Message(Message::GetData(inv)));
-                    },
+                    for i in 0..txin_count {
+                        let mut prev_txid = [0; 32];
+                        reader.read_exact(&mut prev_txid).await.unwrap();
 
-                    Ok(Message::Ping(ping)) => {
-                        tx.send(PeerMessage::Message(Message::Pong(ping)));
-                    },
+                        let output_index = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
 
-                    _ => {
+                        let len = read_varint_num!(&mut reader);
 
+                        let mut buffer = vec![0; len as usize];
+                        reader.read_exact(buffer.as_mut_slice()).await.unwrap();
+
+                        let sequence_number = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+
+                        tx_in.push(
+                            TxIn {
+                                prev_output: OutPoint {
+                                    hash: Hash256(prev_txid),
+                                    index: output_index,
+                                },
+                                sig_script: Script(buffer),
+                                sequence: sequence_number,
+                            }
+                        )
                     }
-                };
+
+                    let txout_count = read_varint_num!(&mut reader);
+                    // println!("txout_count = {:?}", txout_count);
+
+                    let mut tx_out = vec![];
+
+                    for j in 0..txout_count {
+                        let satoshis = AsyncReadBytesExt::read_u64::<LittleEndian>(&mut reader).await.unwrap();
+
+                        let len = read_varint_num!(&mut reader);
+                        let mut script = Script::new();
+
+                        if len > 0 {
+                            let mut buffer = vec![0; len as usize];
+                            reader.read_exact(buffer.as_mut_slice()).await.unwrap();
+                            script = Script(buffer);
+                        }
+
+                        tx_out.push(TxOut{
+                            amount: Amount(satoshis as i64),
+                            pk_script: script,
+                        });
+                    }
+
+                    let lock_time = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await.unwrap();
+                    let tx = Tx {
+                        version,
+                        inputs: tx_in,
+                        outputs: tx_out,
+                        lock_time: lock_time,
+                    };
+
+                    println!("tx = {:?}", tx);
+                }
+                continue;
             }
+
+            let mut buffer = vec![0; payload_size];
+            reader.read_exact(buffer.as_mut_slice()).await;
+
+            let mut rdr = Cursor::new(&buffer);
+            let message = Message::read_partial(&mut rdr, &header);
+            // println!("{:?}", message);
+
+            match message {
+                Ok(Message::Tx(tx)) => {
+                    // println!("transaction {:?}", tx.hash());
+                    let outputs = tx.outputs;
+                    for output in outputs {
+                        let amount = output.amount;
+
+                        if amount.0 == 0 {
+                            continue;
+                        }
+
+                        match extract_pubkeyhash(&output.pk_script.0) {
+                            Ok(ref hash160) => {
+                                let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
+                                // println!("address = {}, amount = {:?}", address, amount);
+                            },
+                            Err(err) => {
+
+                            }
+                        }
+                    }
+                },
+
+                Ok(Message::Version(v)) => {
+                    println!("version {:?}", v);
+                    tx.send(PeerMessage::Message(Message::Verack));
+
+
+                    let mut inv = Inv {
+                        objects: Vec::new(),
+                    };
+
+                    inv.objects.push(InvVect {
+                        obj_type: INV_VECT_BLOCK,
+                        hash: Hash256::decode("00000000000000000431fe7834b59fd4ff5a296db88944f4a8f2e3e6761465d6").unwrap(),
+                    });
+
+                    tx.send(PeerMessage::Message(Message::GetData(inv)));
+
+                    // let locator = BlockLocator {
+                    //     version: 70015,
+                    //     block_locator_hashes: vec![   
+                    //         NO_HASH_STOP,
+                    //         Hash256::decode("6677889900667788990066778899006677889900667788990066778899006677")
+                    //             .unwrap(),
+                    //     ],
+                    //     hash_stop: Hash256::decode(
+                    //         "1122334455112233445511223344551122334455112233445511223344551122",
+                    //     )
+                    //     .unwrap(),
+                    // };
+
+                    // tx.send(PeerMessage::Message(Message::GetHeaders(locator)));
+                },
+
+                Ok(Message::Block(block)) => {
+                    println!("got a block {:?}", block);
+                },
+
+                Ok(Message::Headers(headers)) => {
+                    let headers = headers.headers;
+                    for header in headers {
+                        println!("header = {:?}", header.hash());
+                        let mut inv = Inv {
+                            objects: Vec::new(),
+                        };
+
+                        inv.objects.push(InvVect {
+                            obj_type: INV_VECT_BLOCK,
+                            hash: header.hash(),
+                        });
+
+                        // tx.send(PeerMessage::Message(Message::GetBlocks));
+                        // break;
+                    }
+                    
+                },
+
+                Ok(Message::Verack) => {
+                    // request Mempool transactions
+                    // tx.send(Message::Mempool);
+                    tx.send(PeerMessage::Message(Message::GetAddr));
+                },
+
+                Ok(Message::Inv(inv)) => {
+                    tx.send(PeerMessage::Message(Message::GetData(inv)));
+                },
+
+                Ok(Message::Ping(ping)) => {
+                    tx.send(PeerMessage::Message(Message::Pong(ping)));
+                },
+
+                _ => {
+
+                }
+            };
         }
     }
 }
