@@ -16,12 +16,13 @@ use sv::messages::{
     Tx,
     Version, NodeAddr, Message, MessageHeader
 };
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 
 use sv::script::Script;
 use sv::util::{Hash256, Amount};
 use sv::network::Network;
 use std::io::Cursor;
-use tokio::sync::{ Mutex, Semaphore};
+use tokio::sync::{ RwLock, Mutex, Semaphore};
 
 use std::sync;
 use std::sync::{Arc};
@@ -33,8 +34,12 @@ use std::collections::HashSet;
 use dns_lookup::{lookup_host, lookup_addr};
 use serde_derive::Deserialize;
 use toml;
+use reqwest;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod peer;
+use crate::peer::Peer;
+// mod peer;
 
 
 macro_rules! read_varint_num {
@@ -79,145 +84,110 @@ struct RedisConfig {
 }
 
 
+struct PeerManager {
+
+}
+
+impl PeerManager {
+    pub fn new() -> Self {
+        Self{
+
+        }
+    }
+    
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {   
     
-
-    // let mut f = File::open("/Users/taoxiaojie/Library/Application Support/Bitcoin/blocks/blk00027.dat").await?;
-
-    // loop {
-    //     let magic = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-    //     if magic != 0xd9b4bef9 {
-    //         println!("magic = {}", magic);
-    //         break;
-    //     }
-
-    //     let block_length = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-
-    //     let mut header = [0; 80];
-    //     f.read_exact(&mut header).await;
-
-    //     let mut rdr = Cursor::new(&header[..]);
-
-    //     let block_header = BlockHeader::from_buf(&header).unwrap();
-    //     println!("block_header = {:?}", block_header);
-
-
-    //     let tx_count = read_varint_num!(&mut f);
-        
-    //     for i in 0..tx_count {
-    //         let version = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-
-    //         let txin_count = read_varint_num!(&mut f);
-    //         // println!("txin_count = {:?}", txin_count);
-
-    //         let mut tx_in = vec![];
-
-    //         for i in 0..txin_count {
-    //             let mut prev_txid = [0; 32];
-    //             f.read_exact(&mut prev_txid).await?;
-
-    //             let output_index = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-
-    //             let len = read_varint_num!(&mut f);
-
-    //             let mut buffer = vec![0; len as usize];
-    //             f.read_exact(buffer.as_mut_slice()).await?;
-
-    //             let sequence_number = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-
-    //             tx_in.push(
-    //                 TxIn {
-    //                     prev_output: OutPoint {
-    //                         hash: Hash256(prev_txid),
-    //                         index: output_index,
-    //                     },
-    //                     sig_script: Script(buffer),
-    //                     sequence: sequence_number,
-    //                 }
-    //             )
-    //         }
-
-    //         let txout_count = read_varint_num!(&mut f);
-    //         // println!("txout_count = {:?}", txout_count);
-
-    //         let mut tx_out = vec![];
-
-    //         for j in 0..txout_count {
-    //             let satoshis = AsyncReadBytesExt::read_u64::<LittleEndian>(&mut f).await?;
-
-    //             let len = read_varint_num!(&mut f);
-    //             let mut script = Script::new();
-
-    //             if len > 0 {
-    //                 let mut buffer = vec![0; len as usize];
-    //                 f.read_exact(buffer.as_mut_slice()).await?;
-    //                 script = Script(buffer);
-    //             }
-
-    //             tx_out.push(TxOut{
-    //                 amount: Amount(satoshis as i64),
-    //                 pk_script: script,
-    //             });
-    //         }
-
-    //         let lock_time = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut f).await?;
-    //         let tx = Tx {
-    //             version,
-    //             inputs: tx_in,
-    //             outputs: tx_out,
-    //             lock_time: lock_time,
-    //         };
-
-    //         println!("tx = {:?}", tx);
-    //     }
-    
-        
-    //     // println!("tx_count = {:?}", tx_count);
-    // }
-       
-    //
     let dir = std::env::current_dir().unwrap();
     let file_path = dir.join("address.txt");
     let config_file = dir.join("config.toml");
     
-    {
-        let mut f = File::open(config_file).await?;
-        let mut contents = String::new();
-        f.read_to_string(&mut contents).await?;
-        let decoded: Config = toml::from_str(&contents).unwrap();
-        // println!("{:#?}", decoded);
-    }
+    let mut f = File::open(config_file).await?;
+    let mut contents = String::new();
+    f.read_to_string(&mut contents).await?;
+    let decoded: Config = toml::from_str(&contents).unwrap();
+    let redis_config = decoded.redis.unwrap();
     
+    
+    let mut addrs = HashSet::new();
+
     let mut f = File::open(file_path).await?;
     
     let mut contents = String::new();
     f.read_to_string(&mut contents).await?;
-
-    println!("current dir = {:?}", dir.to_str().unwrap());
-
+    
     let list:Vec<&str> = contents.split("\n").collect();
-    let mut addrs = HashSet::new();
+
     for item in list {
         if item.trim().len() > 0 {
             addrs.insert(item.to_owned());
         }
     }
 
+    use std::collections::HashMap;
+    use serde_json::{json, Result, Value};
+
+    let limit:usize = 100;
+    let mut page:usize =  1;
+
+    // loop {
+    //     let mut map = HashMap::new();
+
+    //     map.insert("method", "priv.query_address".to_owned());
+
+
+    //     let params = json!({
+    //         "limit": limit,
+    //         "page": page,
+    //     });
+
+    //     map.insert("params", params.to_string());
+    //     println!("map is {:?}", map);
+
+    //     let client = reqwest::Client::new();
+    //     let res = client.post("https://volt.id/api.json")
+    //         .json(&map)
+    //         .send()
+    //         .await?
+    //         .text()
+    //         .await?;
+        
+    //     let v: Value = serde_json::from_str(&res)?;
+
+    //     match &v["data"] {
+    //         Value::Array(list) => {
+    //             page = page + 1;
+    //             for item in list {
+    //                 addrs.insert(item["address"].as_str().unwrap().to_owned());
+    //             }
+    //             if list.len() < limit {
+    //                 break;
+    //             }
+    //         },
+    //         _ => {
+
+    //         }
+    //     }
+    // }
+
     let seeds = vec![
-        "seed.bitcoinsv.io", 
+        "seed.satoshisvision.network",
         "seed.bitprim.org",
+        "seed.bitcoinsv.io", 
         "seed.deadalnix.me",   
         "seeder.criptolayer.net",
     ];
 
-    let mut ips: Vec<std::net::IpAddr> = vec![];
+    let mut pending_peers: Vec<NodeAddr> = vec![];
 
     for hostname in seeds {
         match lookup_host(hostname) {
             Ok(list) => {
-                ips = list; 
-                break;
+                for item in list {
+                    pending_peers.push(NodeAddr::new(item, 8333));
+                }
             },
             Err(err) => {
                 println!("lookup_host {} occurs error {:?}", hostname, err);
@@ -225,20 +195,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
     }
 
-    let addr_map = Arc::new(Mutex::new(addrs));
+    let addr_map = Arc::new(RwLock::new(addrs));
 
     let addr_map_clone = addr_map.clone();
     tokio::spawn( async move  {
+        let config = redis_config;
+        let host = format!("redis://{}:{}/", config.ip.unwrap(), config.port.unwrap());
+
         use redis::{self, AsyncCommands};
         loop {
-            let client = redis::Client::open("redis://127.0.0.1:6379/").expect("can not connect to redis server!");
+            let client = redis::Client::open(host.clone()).expect("can not connect to redis server!");
             let mut con = client.get_async_connection().await.unwrap();
             println!("connected to redis server");
             loop {
                 match con.brpop::<&str, (String, String)>("list_1", 0).await {
                     Ok((k, v)) => {
                         println!("value is {:?}", v);
-                        let mut lock = addr_map_clone.lock().await;
+                        let mut lock = addr_map_clone.write().await;
                         (*lock).insert(v);
                     },
                     Err(err) => {
@@ -251,19 +224,72 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    for ip in ips {
-        let addr = std::net::SocketAddr::new(ip, 8333);
-        println!("ips = {:?}", addr);
-        let addrs = addr_map.clone();
-        tokio::spawn(async move {
-            // match peer::Peer::connect(addr, addrs).await {
-            //     Err(err) => {
-            //         println!("connect {} occurs error {:?}", addr, err);
-            //     },
-            //     _ => {
 
-            //     }
-            // }            
+    let (tx,  mut rx) = unbounded_channel::<NodeAddr>();
+    
+
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        for addr in pending_peers {
+            tx_clone.send(addr);
+        }
+    });
+
+    // for ip in ips {
+    //     let addr = std::net::SocketAddr::new(ip, 8333);
+    //     println!("ip = {:?}", addr);
+    //     let addrs = addr_map.clone();
+    //     let tx_clone = tx.clone();
+    //     let connected = connected.clone();
+    //     tokio::spawn(async move {
+    //         let mut peer = Peer::new(addr.to_string(), addrs, tx_clone);
+    //         match peer.connect().await {
+    //             Err(err) => {
+    //                 println!("connect {} occurs error {:?}", addr, err);
+    //             },
+    //             _ => {
+    //                 connected.fetch_add(1, Ordering::SeqCst);
+    //             }
+    //         }           
+    //     });
+    // }
+
+    let connected = Arc::new(AtomicUsize::new(0));
+    let mut peers: Arc<Mutex<HashSet<NodeAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let mut blocks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    while let Some(nodeAddr) = rx.recv().await {
+        if connected.load(Ordering::SeqCst) > 50 {
+            let mut lock = peers.lock().await;
+            (*lock).insert(nodeAddr);
+            continue;
+        }
+
+        let watch_addrs = addr_map.clone();
+        let tx_clone = tx.clone();
+        let connected_clone = connected.clone();
+        let peers_clone = peers.clone();
+        let blocks_clone = blocks.clone();
+
+        tokio::spawn(async move {
+            let ip = nodeAddr.ip;
+            let mut peer = Peer::new(nodeAddr, watch_addrs, tx_clone.clone(), blocks_clone);
+            connected_clone.fetch_add(1, Ordering::SeqCst);
+
+            peer.connect().await;
+            connected_clone.fetch_sub(1, Ordering::SeqCst);
+            let mut lock = peers_clone.lock().await;
+            println!("connect {:?} error", ip);
+            
+            while connected_clone.load(Ordering::SeqCst) < 50 {
+                if let Some(ele) = (*lock).iter().next().cloned() {
+                    (*lock).take(&ele).unwrap();
+                    println!("reconnect to {:?}", ele.ip);
+                    tx_clone.send(ele);
+                }  else {
+                    break;
+                }
+            }
         });
     }
     

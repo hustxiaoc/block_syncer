@@ -2,4 +2,4 @@ global_string = "test"
 global_integer = 5
 [redis]
 ip = "127.0.0.1"
-port = 80
+port = 6379

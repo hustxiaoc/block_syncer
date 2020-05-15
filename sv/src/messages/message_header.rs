@@ -32,7 +32,10 @@ impl MessageHeader {
         let bytes = self.command.to_vec().iter().filter(|&c| {
             *c > 0
         }).map(|x| *x).collect::<Vec<u8>>();
-        std::str::from_utf8(bytes.as_ref()).unwrap().to_owned()
+        match std::str::from_utf8(bytes.as_ref()) {
+            Ok(s) => s.to_owned(),
+            Err(_) => "unknown".to_owned()
+        }
     }
 
     /// Checks if the header is valid

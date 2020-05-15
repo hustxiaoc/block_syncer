@@ -1,5 +1,6 @@
 use tokio::net::TcpStream;
 use tokio::prelude::*;
+use tokio::sync::{Mutex, RwLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 use tokio::time::delay_for;
 use tokio::time::{timeout, Duration};
@@ -16,6 +17,7 @@ use sv::messages::{
     BlockLocator,
     NO_HASH_STOP,
     TxIn, TxOut, Tx, OutPoint,
+    INV_VECT_TX,
     INV_VECT_BLOCK, InvVect,
     Version, NodeAddr, Message, MessageHeader
 };
@@ -34,6 +36,9 @@ use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt};
 use tokio_byteorder::{LittleEndian, AsyncWriteBytesExt, AsyncReadBytesExt};
 use std::collections::HashSet;
+
+const init_block_header: &str = "00000000000000000208b2921839605f12b7969019ac14592e33c924d1cc0865";
+const first_block_header: &str = "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048";
 
 macro_rules! read_varint_num {
     ($e:expr) => {  
@@ -62,6 +67,26 @@ macro_rules! read_varint_num {
     };
 }
 
+macro_rules! drain_buf {
+    ($reader:expr, $len: expr, $buf_len: expr) => {
+        let mut read = 0;
+        loop {
+            let mut need_read = $buf_len;
+            let remain = $len - read;
+            if remain < need_read {
+                need_read = remain;
+            }
+
+            if need_read == 0 {
+                break;
+            }
+            let mut buffer = vec![0; need_read as usize];
+            $reader.read_exact(buffer.as_mut_slice()).await?;
+            read = read + need_read;
+        }
+    }
+}
+
 enum PeerMessage {
     Message(Message),
     Stop
@@ -74,84 +99,61 @@ pub trait MessageHandle {
 }
 
 pub struct Peer {
-    addr: String,
+    addr: NodeAddr,
     runing: Arc<AtomicBool>,
+    watch_addrs: Arc<RwLock<HashSet<String>>>,
+    blocks: Arc<Mutex<HashSet<String>>>,
+    addr_tx: UnboundedSender<NodeAddr>,
+    tx: Option<UnboundedSender<PeerMessage>>,
 }
 
 impl Peer {
-
-    pub async fn connect<A: tokio::net::ToSocketAddrs>(addr: A, addrs: HashSet<String>) -> Result<Peer, Box<dyn Error>> {
-        let dir = std::env::current_dir().unwrap();
-        println!("current dir = {:?}", dir.to_str().unwrap());
-
-        let mut stream = TcpStream::connect(addr).await?;
-        let (mut reader, mut writer) = tokio::io::split(stream);
-        let (mut tx, mut rx) = unbounded_channel::<PeerMessage>();
+    pub fn new(addr: NodeAddr, watch_addrs: Arc<RwLock<HashSet<String>>>, tx: UnboundedSender<NodeAddr>, blocks: Arc<Mutex<HashSet<String>>>) -> Self {
 
         let peer = Peer {
-            addr: "addr".to_owned(),
+            blocks,
+            addr,
+            watch_addrs,
+            addr_tx: tx,
             runing: Arc::new(AtomicBool::new(true)),
+            tx: None,
         };
 
-        tokio::spawn(Self::start_background_task(
-            rx,
-            writer,
-        ));
-
-        tokio::spawn(Self::start_ping_task(peer.runing.clone(), tx.clone()));
-
-        let running = peer.runing.clone();
-        tokio::spawn(async move {
-            match Self::run(running, tx, reader, addrs).await {
-                Ok(_) => {},
-                Err(err) => {
-                    println!("peer running error {:?}", err);
-                }
-            }
-        });
-
-        Ok(peer)
+        peer
     }
 
-    async fn start_background_task(mut rx: UnboundedReceiver<PeerMessage>,  mut writer: WriteHalf<TcpStream>) {
-        let magic = Network::Mainnet.magic();
-        while let Some(message) = rx.recv().await {
-            match message {
-                PeerMessage::Message(msg) => {
-                    // println!("got = {:?}", message);
-                    let mut ss = vec![];
-                    msg.write(&mut ss, magic);
-                    writer.write(&ss).await;
-                },
-                PeerMessage::Stop => {
-                    println!("stop message");
-                    break;
-                },
-                _ => {
 
-                }
+    pub async fn connect(&mut self) -> Result<(), Box<dyn Error>> {
+
+        let (tx,  rx) = unbounded_channel::<PeerMessage>();
+
+        let addr = std::net::SocketAddr::new(std::net::IpAddr::V6(self.addr.ip), self.addr.port);
+        let stream = TcpStream::connect(addr).await?;
+        let (reader, writer) = tokio::io::split(stream);
+
+        let tx_clone = tx.clone();
+
+        self.tx = Some(tx);    
+
+        self.start_background_task(rx, writer);
+        self.start_ping_task();
+        self.send_version();
+
+        match self.run(reader).await {
+            Ok(_) => {
+
+            },
+            Err(err) => {
+                println!("peer running error {:?}", err);
+                tx_clone.send(PeerMessage::Stop);
             }
-        }
+        };
+
+        Ok(())
     }
 
-    async fn start_ping_task(runing: Arc<AtomicBool>, tx: UnboundedSender<PeerMessage>) {
-        loop {
-            if runing.load(Ordering::Relaxed) == false {
-                break;
-            }
-
-            delay_for(Duration::from_millis(1000 * 30)).await;
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            tx.send(PeerMessage::Message(Message::Ping(Ping{
-                nonce: now as u64,
-            })));
-        }
-    }
-
-    async fn run(runing: Arc<AtomicBool>, tx: UnboundedSender<PeerMessage>, mut reader: ReadHalf<TcpStream>, addrs: HashSet<String>) -> Result<(), Box<dyn Error>>  {
-
+    fn send_version(&self) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
         let version = Version {
             version: 70012,
             services: 0,
@@ -171,13 +173,62 @@ impl Peer {
             start_height: 0,
             relay: true,
         };
+        self.tx.as_ref().unwrap().send(PeerMessage::Message(Message::Version(version)));
+    }
 
-        tx.send(PeerMessage::Message(Message::Version(version)));
+    fn start_background_task(&self, mut rx: UnboundedReceiver<PeerMessage>,  mut writer: WriteHalf<TcpStream>) {
+        tokio::spawn(async move {
+            let magic = Network::Mainnet.magic();
+            while let Some(message) = rx.recv().await {
+                match message {
+                    PeerMessage::Message(msg) => {
+                        // println!("got = {:?}", message);
+                        let mut ss = vec![];
+                        msg.write(&mut ss, magic);
+                        writer.write(&ss).await;
+                    },
+                    PeerMessage::Stop => {
+                        println!("stop message");
+                        break;
+                    },
+                    _ => {
+    
+                    }
+                }
+            }
+        });
+    }
+
+
+    fn start_ping_task(&self) {
+        let runing = self.runing.clone();
+        let tx = self.tx.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            loop {
+                if runing.load(Ordering::Relaxed) == false {
+                    break;
+                }
+    
+                delay_for(Duration::from_millis(1000 * 30)).await;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                tx.send(PeerMessage::Message(Message::Ping(Ping{
+                    nonce: now as u64,
+                })));
+            }
+        });
+    }
+
+    async fn run(
+        &self,
+        mut reader: ReadHalf<TcpStream>, 
+    ) -> Result<(), Box<dyn Error>> {
+        let tx = self.tx.as_ref().unwrap();
+        let mut version:Option<Version> = None;
 
         loop {
             let mut header = [0; 24];
 
-            let n = reader.read_exact(&mut header).await?;
+            reader.read_exact(&mut header).await?;
 
             let mut rdr = Cursor::new(&header);
 
@@ -185,10 +236,10 @@ impl Peer {
                 ..Default::default()
             };
 
-            rdr.read(&mut header.magic).await;
-            rdr.read(&mut header.command).await;
+            rdr.read(&mut header.magic).await?;
+            rdr.read(&mut header.command).await?;
             header.payload_size = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut rdr).await?;
-            rdr.read(&mut header.checksum).await;
+            rdr.read(&mut header.checksum).await?;
 
             // println!("read header {:?}", header);
 
@@ -202,17 +253,24 @@ impl Peer {
             if command == "block" {
                 println!("start reading block");
                 let mut header = [0; 80];
-                reader.read_exact(&mut header).await;
-
-                let mut rdr = Cursor::new(&header[..]);
+                reader.read_exact(&mut header).await?;
 
                 let block_header = BlockHeader::from_buf(&header).unwrap();
-                println!("[begin] block header = {:?}", block_header);
-
+                println!("[begin] block = {:?}", block_header.hash());
+                let block_hash = block_header.hash().encode();
+                {
+                    let lock = self.blocks.lock().await;
+                    // 该区块已经处理
+                    if (*lock).contains(&block_hash) {
+                        println!("drain buf {}", payload_size);
+                        drain_buf!(&mut reader, payload_size, 1024);
+                        continue;
+                    }
+                }
 
                 let tx_count = read_varint_num!(&mut reader);
                 
-                for i in 0..tx_count {
+                for _ in 0..tx_count {
                     let version = AsyncReadBytesExt::read_u32::<LittleEndian>(&mut reader).await?;
 
                     let txin_count = read_varint_num!(&mut reader);
@@ -250,7 +308,7 @@ impl Peer {
 
                     let mut tx_out = vec![];
 
-                    for j in 0..txout_count {
+                    for _ in 0..txout_count {
                         let satoshis = AsyncReadBytesExt::read_u64::<LittleEndian>(&mut reader).await?;
 
                         let len = read_varint_num!(&mut reader);
@@ -287,10 +345,11 @@ impl Peer {
                         match extract_pubkeyhash(&output.pk_script.0) {
                             Ok(ref hash160) => {
                                 let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
-                                if addrs.contains(&address) {
+                                let lock = self.watch_addrs.read().await;
+                                if (*lock).contains(&address) {
                                     println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                                 }
-                                println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                             },
                             Err(err) => {
 
@@ -298,7 +357,13 @@ impl Peer {
                         }
                     }
                 }
-                println!("[end] block header = {:?}", block_header);
+                println!("[end] block = {:?}", block_header.hash());
+                {
+                    let mut lock = self.blocks.lock().await;
+                    // 该区块已经处理
+                    (*lock).insert(block_hash);
+                }
+
                 continue;
             }
 
@@ -312,6 +377,7 @@ impl Peer {
             match message {
                 Ok(Message::Tx(ref tx)) => {
                     // println!("transaction {:?}", tx.hash());
+                    
                     let outputs = &tx.outputs;
                     for output in outputs {
                         let amount = output.amount;
@@ -323,10 +389,11 @@ impl Peer {
                         match extract_pubkeyhash(&output.pk_script.0) {
                             Ok(ref hash160) => {
                                 let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
-                                if addrs.contains(&address) {
+                                let lock = self.watch_addrs.read().await;
+                                if (*lock).contains(&address) {
                                     println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                                 }
-                                println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                             },
                             Err(err) => {
 
@@ -335,54 +402,72 @@ impl Peer {
                     }
                 },
 
+                Ok(Message::NotFound(inv)) => {
+                    // let items = inv.objects;
+                    // for item in items {
+                    //     // This node cannot find init tx, we disconnect it.
+                    //     if item.obj_type == INV_VECT_TX && item.hash.encode() == init_tx {
+                    //         let error = "Node cannot find target transaction";
+                    //         return Err(error.into());
+                    //     }
+                    // }
+                },
+
                 Ok(Message::Version(v)) => {
                     println!("version {:?}", v);
+                    version = Some(v);
                     tx.send(PeerMessage::Message(Message::Verack));
 
 
-                    let mut inv = Inv {
-                        objects: Vec::new(),
-                    };
+                    // let mut inv = Inv {
+                    //     objects: Vec::new(),
+                    // };
 
-                    inv.objects.push(InvVect {
-                        obj_type: INV_VECT_BLOCK,
-                        hash: Hash256::decode("00000000000000000431fe7834b59fd4ff5a296db88944f4a8f2e3e6761465d6").unwrap(),
-                    });
+                    // inv.objects.push(InvVect {
+                    //     obj_type: INV_VECT_TX,
+                    //     hash: Hash256::decode(init_tx).unwrap(),
+                    // });
 
                     // tx.send(PeerMessage::Message(Message::GetData(inv)));
 
-                    // let locator = BlockLocator {
-                    //     version: 70015,
-                    //     block_locator_hashes: vec![   
-                    //         NO_HASH_STOP,
-                    //         Hash256::decode("6677889900667788990066778899006677889900667788990066778899006677")
-                    //             .unwrap(),
-                    //     ],
-                    //     hash_stop: Hash256::decode(
-                    //         "1122334455112233445511223344551122334455112233445511223344551122",
-                    //     )
-                    //     .unwrap(),
-                    // };
+                    let locator = BlockLocator {
+                        version: 70015,
+                        block_locator_hashes: vec![   
+                            NO_HASH_STOP,
+                            Hash256::decode(init_block_header).unwrap(),
+                        ],
+                        hash_stop: Hash256::decode(init_block_header).unwrap(),
+                    };
 
-                    // tx.send(PeerMessage::Message(Message::GetHeaders(locator)));
+                    tx.send(PeerMessage::Message(Message::GetHeaders(locator)));
                 },
 
                 Ok(Message::Block(block)) => {
                     println!("got a block {:?}", block);
                 },
 
+                Ok(Message::GetBlocks(_)) => {
+                    let error = format!("We don't provide such service byebye! node with version {:?}", version);
+                    return Err(error.into());
+                },
+
                 Ok(Message::Headers(headers)) => {
                     let headers = headers.headers;
                     for header in headers {
-                        println!("header = {:?}", header.hash());
-                        let mut inv = Inv {
-                            objects: Vec::new(),
-                        };
+                        if header.hash().encode() == first_block_header {
+                            let error = format!("Invalid node with version {:?}", version);
+                            return Err(error.into());
+                        }
 
-                        inv.objects.push(InvVect {
-                            obj_type: INV_VECT_BLOCK,
-                            hash: header.hash(),
-                        });
+                        // println!("header = {:?}", header.hash());
+                        // let mut inv = Inv {
+                        //     objects: Vec::new(),
+                        // };
+
+                        // inv.objects.push(InvVect {
+                        //     obj_type: INV_VECT_BLOCK,
+                        //     hash: header.hash(),
+                        // });
 
                         // tx.send(PeerMessage::Message(Message::GetBlocks));
                         // break;
@@ -405,10 +490,16 @@ impl Peer {
                 },
 
                 Ok(Message::Addr(addr)) => {
-                    println!("get a addr message {:?}", addr);
+                    // println!("get a addr message {:?}", addr);
                     let addrs = addr.addrs;
+                    
                     for address in addrs {
-                        println!("get a address message {:?}", address);
+                        // no network service
+                        if address.addr.services & 1 == 0 {
+                            continue;
+                        }
+                        // println!("get a address message {:?}", address);
+                        self.addr_tx.send(address.addr);
                     }
                 }
 
