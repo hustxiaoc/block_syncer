@@ -7,6 +7,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use linked_hash_map::LinkedHashMap;
 use std::fmt;
 use std::io;
+use hex;
 use std::io::{Read, Write};
 
 /// Maximum number of satoshis possible
@@ -125,6 +126,12 @@ impl Tx {
         return self.inputs.len() == 1
             && self.inputs[0].prev_output.hash == COINBASE_OUTPOINT_HASH
             && self.inputs[0].prev_output.index == COINBASE_OUTPOINT_INDEX;
+    }
+
+    pub fn encode(&self) -> String {
+        let mut v = Vec::new();
+        self.write(&mut v).unwrap();
+        hex::encode(v)
     }
 }
 

@@ -104,17 +104,24 @@ pub struct Peer {
     watch_addrs: Arc<RwLock<HashSet<String>>>,
     blocks: Arc<Mutex<HashSet<String>>>,
     addr_tx: UnboundedSender<NodeAddr>,
+    tx_sender: UnboundedSender<(Tx, String)>,
     tx: Option<UnboundedSender<PeerMessage>>,
 }
 
 impl Peer {
-    pub fn new(addr: NodeAddr, watch_addrs: Arc<RwLock<HashSet<String>>>, tx: UnboundedSender<NodeAddr>, blocks: Arc<Mutex<HashSet<String>>>) -> Self {
+    pub fn new(
+        addr: NodeAddr, watch_addrs: Arc<RwLock<HashSet<String>>>, 
+        tx: UnboundedSender<NodeAddr>, 
+        blocks: Arc<Mutex<HashSet<String>>>,
+        tx_sender: UnboundedSender<(Tx, String)>,
+    ) -> Self {
 
         let peer = Peer {
             blocks,
             addr,
             watch_addrs,
             addr_tx: tx,
+            tx_sender,
             runing: Arc::new(AtomicBool::new(true)),
             tx: None,
         };
@@ -347,7 +354,7 @@ impl Peer {
                                 let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
                                 let lock = self.watch_addrs.read().await;
                                 if (*lock).contains(&address) {
-                                    println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
                                 }
                                 // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                             },
@@ -377,6 +384,7 @@ impl Peer {
             match message {
                 Ok(Message::Tx(ref tx)) => {
                     // println!("transaction {:?}", tx.hash());
+                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
                     
                     let outputs = &tx.outputs;
                     for output in outputs {
@@ -391,7 +399,7 @@ impl Peer {
                                 let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
                                 let lock = self.watch_addrs.read().await;
                                 if (*lock).contains(&address) {
-                                    println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
                                 }
                                 // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
                             },

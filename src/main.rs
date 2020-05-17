@@ -27,8 +27,8 @@ use tokio::sync::{ RwLock, Mutex, Semaphore};
 use std::sync;
 use std::sync::{Arc};
 use std::thread;
-use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio_byteorder::{LittleEndian, AsyncWriteBytesExt, AsyncReadBytesExt};
 use std::collections::HashSet;
 use dns_lookup::{lookup_host, lookup_addr};
@@ -39,6 +39,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod peer;
 use crate::peer::Peer;
+
+use log::{debug, error, info, trace, warn, LevelFilter, SetLoggerError};
+use log4rs::{
+    append::{
+        console::{ConsoleAppender, Target},
+        file::FileAppender,
+    },
+    config::{Appender, Config, Root},
+    encode::pattern::PatternEncoder,
+    filter::threshold::ThresholdFilter,
+};
 // mod peer;
 
 
@@ -71,7 +82,7 @@ macro_rules! read_varint_num {
 
 
 #[derive(Debug, Deserialize)]
-struct Config {
+struct AppConfig {
     global_string: Option<String>,
     global_integer: Option<u64>,
     redis: Option<RedisConfig>,
@@ -99,78 +110,131 @@ impl PeerManager {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {   
-    
+    // let stdout = ConsoleAppender::builder().build();
+
+    // let level = log::LevelFilter::Info;
+    // let file_path = "log/foo.log";
+
+    // // Build a stderr logger.
+    // let stderr = ConsoleAppender::builder().target(Target::Stderr).build();
+
+    // // Logging to log file.
+    // let logfile = FileAppender::builder()
+    //     // Pattern: https://docs.rs/log4rs/*/log4rs/encode/pattern/index.html
+    //     .encoder(Box::new(PatternEncoder::new("{l} - {m}\n")))
+    //     .build(file_path)
+    //     .unwrap();
+
+    // // Log Trace level output to file where trace is the default level
+    // // and the programmatically specified level to stderr.
+    // let config = Config::builder()
+    //     .appender(Appender::builder().build("logfile", Box::new(logfile)))
+    //     .appender(
+    //         Appender::builder()
+    //             .filter(Box::new(ThresholdFilter::new(level)))
+    //             .build("stderr", Box::new(stderr)),
+    //     )
+    //     .build(
+    //         Root::builder()
+    //             .appender("logfile")
+    //             .appender("stderr")
+    //             .build(LevelFilter::Trace),
+    //     )
+    //     .unwrap();
+
+    // // Use this to change log levels at runtime.
+    // // This means you can change the default log level to trace
+    // // if you are trying to debug an issue and need more logs on then turn it off
+    // // once you are done.
+    // let _handle = log4rs::init_config(config)?;
+
+    // error!("Goes to stderr and file");
+    // warn!("Goes to stderr and file");
+    // info!("Goes to stderr and file");
+    // debug!("Goes to file only");
+    // trace!("Goes to file only");
+
+
     let dir = std::env::current_dir().unwrap();
-    let file_path = dir.join("address.txt");
     let config_file = dir.join("config.toml");
     
     let mut f = File::open(config_file).await?;
     let mut contents = String::new();
     f.read_to_string(&mut contents).await?;
-    let decoded: Config = toml::from_str(&contents).unwrap();
+    let decoded: AppConfig = toml::from_str(&contents).unwrap();
     let redis_config = decoded.redis.unwrap();
     
     
     let mut addrs = HashSet::new();
 
-    let mut f = File::open(file_path).await?;
     
-    let mut contents = String::new();
-    f.read_to_string(&mut contents).await?;
-    
-    let list:Vec<&str> = contents.split("\n").collect();
-
-    for item in list {
-        if item.trim().len() > 0 {
-            addrs.insert(item.to_owned());
-        }
-    }
-
     use std::collections::HashMap;
     use serde_json::{json, Result, Value};
 
-    let limit:usize = 100;
-    let mut page:usize =  1;
+    let limit:usize = 1000;
+    let mut id: u64 = 0;
+    let mut file = OpenOptions::new().create(true).append(true).read(true).open("address.txt").await?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).await?;
+    
+    if contents.len() > 0 {
+        let list:Vec<&str> = contents.split("\n").collect();
 
-    // loop {
-    //     let mut map = HashMap::new();
+        for item in list {
+            if item.trim().len() > 0 {
+                let list:Vec<&str> = item.split(":").collect();
+                addrs.insert(list[0].to_owned());
+                id = list[1].parse().unwrap();
+            }
+        } 
+    }
+    
 
-    //     map.insert("method", "priv.query_address".to_owned());
+    loop {
+        let mut map = HashMap::new();
+
+        map.insert("method", "priv.query_address".to_owned());
 
 
-    //     let params = json!({
-    //         "limit": limit,
-    //         "page": page,
-    //     });
+        let params = json!({
+            "limit": limit,
+            "id": id,
+        });
 
-    //     map.insert("params", params.to_string());
-    //     println!("map is {:?}", map);
+        map.insert("params", params.to_string());
+        println!("map is {:?}", map);
 
-    //     let client = reqwest::Client::new();
-    //     let res = client.post("https://volt.id/api.json")
-    //         .json(&map)
-    //         .send()
-    //         .await?
-    //         .text()
-    //         .await?;
+        let client = reqwest::Client::new();
+        let res = client.post("https://volt.id/api.json")
+            .json(&map)
+            .send()
+            .await?
+            .text()
+            .await?;
         
-    //     let v: Value = serde_json::from_str(&res)?;
+        let v: Value = serde_json::from_str(&res)?;
 
-    //     match &v["data"] {
-    //         Value::Array(list) => {
-    //             page = page + 1;
-    //             for item in list {
-    //                 addrs.insert(item["address"].as_str().unwrap().to_owned());
-    //             }
-    //             if list.len() < limit {
-    //                 break;
-    //             }
-    //         },
-    //         _ => {
+        match &v["data"] {
+            Value::Array(list) => {
+                for item in list {
+                    let item_id = item["id"].as_u64().unwrap();
+                    let address = item["address"].as_str().unwrap().to_owned();
+                    if id < item_id {
+                        id = item_id;
+                    }
+                    let content = format!("{}:{}\n", address, item_id);
+                    file.write_all(content.as_bytes()).await?;
+                    addrs.insert(address);
+                }
+                if list.len() < limit {
+                    break;
+                }
+            },
+            _ => {
 
-    //         }
-    //     }
-    // }
+            }
+        }
+    }
 
     let seeds = vec![
         "seed.satoshisvision.network",
@@ -208,9 +272,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut con = client.get_async_connection().await.unwrap();
             println!("connected to redis server");
             loop {
-                match con.brpop::<&str, (String, String)>("list_1", 0).await {
+                match con.brpop::<&str, (String, String)>("threshold_addr_list", 0).await {
                     Ok((k, v)) => {
-                        println!("value is {:?}", v);
+                        println!("got a new address {:?}", v);
                         let mut lock = addr_map_clone.write().await;
                         (*lock).insert(v);
                     },
@@ -226,37 +290,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 
     let (tx,  mut rx) = unbounded_channel::<NodeAddr>();
-    
-
     let tx_clone = tx.clone();
+    
     tokio::spawn(async move {
         for addr in pending_peers {
             tx_clone.send(addr);
         }
     });
 
-    // for ip in ips {
-    //     let addr = std::net::SocketAddr::new(ip, 8333);
-    //     println!("ip = {:?}", addr);
-    //     let addrs = addr_map.clone();
-    //     let tx_clone = tx.clone();
-    //     let connected = connected.clone();
-    //     tokio::spawn(async move {
-    //         let mut peer = Peer::new(addr.to_string(), addrs, tx_clone);
-    //         match peer.connect().await {
-    //             Err(err) => {
-    //                 println!("connect {} occurs error {:?}", addr, err);
-    //             },
-    //             _ => {
-    //                 connected.fetch_add(1, Ordering::SeqCst);
-    //             }
-    //         }           
-    //     });
-    // }
-
     let connected = Arc::new(AtomicUsize::new(0));
     let mut peers: Arc<Mutex<HashSet<NodeAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut blocks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    let (tx_sender,  mut tx_rx) = unbounded_channel::<(Tx, String)>();
+
+    tokio::spawn(async move {
+        let mut file = OpenOptions::new().create(true).append(true).read(true).open("transaction.txt").await.unwrap();
+        
+        while let Some((tx, addr)) = tx_rx.recv().await {
+            use std::io;
+            use std::io::{Read, Write};
+            use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+            println!("got a transaction {:?}", tx.hash());
+            
+            file.write_all(tx.encode().as_bytes()).await.unwrap();
+            file.write_all(b"\n").await.unwrap();
+        }
+    });
 
     while let Some(nodeAddr) = rx.recv().await {
         if connected.load(Ordering::SeqCst) > 50 {
@@ -270,10 +330,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let connected_clone = connected.clone();
         let peers_clone = peers.clone();
         let blocks_clone = blocks.clone();
+        let tx_sender_clone = tx_sender.clone();
 
         tokio::spawn(async move {
             let ip = nodeAddr.ip;
-            let mut peer = Peer::new(nodeAddr, watch_addrs, tx_clone.clone(), blocks_clone);
+            let mut peer = Peer::new(nodeAddr, watch_addrs, tx_clone.clone(), blocks_clone, tx_sender_clone);
             connected_clone.fetch_add(1, Ordering::SeqCst);
 
             peer.connect().await;
@@ -293,11 +354,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
     
-   
-    // peer::Peer::connect("178.62.228.194:8333", addrs).await?;
-
-    // peer::Peer::connect("178.128.147.160:8333", addrs).await?;
-    //
 
     loop {
         delay_for(Duration::from_millis(1000 * 30)).await;
