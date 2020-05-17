@@ -384,8 +384,8 @@ impl Peer {
             match message {
                 Ok(Message::Tx(ref tx)) => {
                     // println!("transaction {:?}", tx.hash());
-                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
-                    
+                    // self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
+
                     let outputs = &tx.outputs;
                     for output in outputs {
                         let amount = output.amount;
