@@ -354,10 +354,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
     
-
-    loop {
-        delay_for(Duration::from_millis(1000 * 30)).await;
-        println!("delay runing");
-    }
     Ok(())
 }

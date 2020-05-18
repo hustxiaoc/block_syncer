@@ -111,7 +111,7 @@ pub struct Peer {
 impl Peer {
     pub fn new(
         addr: NodeAddr, watch_addrs: Arc<RwLock<HashSet<String>>>, 
-        tx: UnboundedSender<NodeAddr>, 
+        addr_tx: UnboundedSender<NodeAddr>, 
         blocks: Arc<Mutex<HashSet<String>>>,
         tx_sender: UnboundedSender<(Tx, String)>,
     ) -> Self {
@@ -120,7 +120,7 @@ impl Peer {
             blocks,
             addr,
             watch_addrs,
-            addr_tx: tx,
+            addr_tx,
             tx_sender,
             runing: Arc::new(AtomicBool::new(true)),
             tx: None,
@@ -495,6 +495,10 @@ impl Peer {
 
                 Ok(Message::Ping(ping)) => {
                     tx.send(PeerMessage::Message(Message::Pong(ping)));
+                },
+
+                Ok(Message::Pong(pong)) => {
+
                 },
 
                 Ok(Message::Addr(addr)) => {
