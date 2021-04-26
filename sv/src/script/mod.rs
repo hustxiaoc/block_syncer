@@ -52,6 +52,10 @@ impl Script {
         Script(vec![])
     }
 
+    pub fn to_address(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Appends a single opcode or data byte
     pub fn append(&mut self, byte: u8) {
         self.0.push(byte);

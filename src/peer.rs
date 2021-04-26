@@ -87,6 +87,7 @@ macro_rules! drain_buf {
     }
 }
 
+#[derive(Debug)]
 enum PeerMessage {
     Message(Message),
     Stop
@@ -176,7 +177,7 @@ impl Peer {
                 port: 0,
             },
             nonce: 1787878,
-            user_agent: "/Bitcoin SV:1.0.2/".into(),
+            user_agent: "/Bitcoin SV:1.0.7.1/".into(),
             start_height: 0,
             relay: true,
         };
@@ -218,9 +219,18 @@ impl Peer {
     
                 delay_for(Duration::from_millis(1000 * 30)).await;
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                tx.send(PeerMessage::Message(Message::Ping(Ping{
+                let message = PeerMessage::Message(Message::Ping(Ping{
                     nonce: now as u64,
-                })));
+                }));
+
+                match tx.send(message) {
+                    Err(e) => {
+                        println!("send message error {:?}", e);
+                    },
+                    _ => {
+
+                    }
+                }
             }
         });
     }
@@ -341,28 +351,28 @@ impl Peer {
                         lock_time: lock_time,
                     };
 
-                    let outputs = &tx.outputs;
-                    for output in outputs {
-                        let amount = output.amount;
+                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
 
-                        if amount.0 == 0 {
-                            continue;
-                        }
+                    // let outputs = &tx.outputs;
+                    // for output in outputs {
+                    //     let amount = output.amount;
 
-                        match extract_pubkeyhash(&output.pk_script.0) {
-                            Ok(ref hash160) => {
-                                let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
-                                let lock = self.watch_addrs.read().await;
-                                if (*lock).contains(&address) {
-                                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
-                                }
-                                // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
-                            },
-                            Err(err) => {
+                    //     if amount.0 == 0 {
+                    //         continue;
+                    //     }
 
-                            }
-                        }
-                    }
+                    //     match extract_pubkeyhash(&output.pk_script.0) {
+                    //         Ok(ref hash160) => {
+                    //             let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
+                    //             let lock = self.watch_addrs.read().await;
+                    //             if (*lock).contains(&address) {
+                    //                 self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
+                    //             }
+                    //             // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
+                    //         },
+                    //         _ => {}
+                    //     }
+                    // }
                 }
                 println!("[end] block = {:?}", block_header.hash());
                 {
@@ -383,31 +393,8 @@ impl Peer {
 
             match message {
                 Ok(Message::Tx(ref tx)) => {
-                    // println!("transaction {:?}", tx.hash());
-                    // self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
-
-                    let outputs = &tx.outputs;
-                    for output in outputs {
-                        let amount = output.amount;
-
-                        if amount.0 == 0 {
-                            continue;
-                        }
-
-                        match extract_pubkeyhash(&output.pk_script.0) {
-                            Ok(ref hash160) => {
-                                let address = addr_encode(hash160, AddressType::P2PKH, Network::Mainnet);
-                                let lock = self.watch_addrs.read().await;
-                                if (*lock).contains(&address) {
-                                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
-                                }
-                                // println!("tx = {:?}, address = {}, amount = {:?}", tx.hash(), address, amount);
-                            },
-                            Err(err) => {
-
-                            }
-                        }
-                    }
+                    // println!("got transaction {:?}", tx.hash());
+                    self.tx_sender.send((tx.clone(), self.addr.ip.to_string()));
                 },
 
                 Ok(Message::NotFound(inv)) => {
@@ -486,15 +473,15 @@ impl Peer {
                 Ok(Message::Verack) => {
                     // request Mempool transactions
                     // tx.send(PeerMessage::Message(Message::Mempool));
-                    tx.send(PeerMessage::Message(Message::GetAddr));
+                    tx.send(PeerMessage::Message(Message::GetAddr)).unwrap();
                 },
 
                 Ok(Message::Inv(inv)) => {
-                    tx.send(PeerMessage::Message(Message::GetData(inv)));
+                    tx.send(PeerMessage::Message(Message::GetData(inv))).unwrap();
                 },
 
                 Ok(Message::Ping(ping)) => {
-                    tx.send(PeerMessage::Message(Message::Pong(ping)));
+                    tx.send(PeerMessage::Message(Message::Pong(ping))).unwrap();
                 },
 
                 Ok(Message::Pong(pong)) => {
@@ -511,7 +498,7 @@ impl Peer {
                             continue;
                         }
                         // println!("get a address message {:?}", address);
-                        self.addr_tx.send(address.addr);
+                        self.addr_tx.send(address.addr).unwrap();
                     }
                 }
 
