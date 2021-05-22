@@ -380,7 +380,6 @@ impl Peer {
                     // 该区块已经处理
                     (*lock).insert(block_hash);
                 }
-
                 continue;
             }
 

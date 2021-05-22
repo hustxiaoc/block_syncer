@@ -44,8 +44,7 @@ use toml;
 use reqwest;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-mod peer;
-use crate::peer::Peer;
+use cryptolib::Peer;
 
 use log::{debug, error, info, trace, warn, LevelFilter, SetLoggerError};
 use log4rs::{
