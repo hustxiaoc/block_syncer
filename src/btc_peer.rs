@@ -300,7 +300,6 @@ impl Peer {
 
             // header.command
             let command = header.get_command();
-            println!("command is {}", command);
 
             let payload_size = header.payload_size as usize;
 
@@ -314,13 +313,18 @@ impl Peer {
             let reply: RawNetworkMessage = stream_reader.read_next()?;
 
             match reply.payload {
+                message::NetworkMessage::Tx(tx) => {
+                    println!("got a tx {:?}", tx);
+                }
+
+                message::NetworkMessage::Block(block) => {
+                    println!("got a block {:?}", block.block_hash());
+                }
+
                 message::NetworkMessage::Alert(message) => {
                     // println!("alert message is {:?}", std::str::from_utf8(&message));
                 }
-                message::NetworkMessage::Block(block) => {
-                    println!("read a new block {:?}", block.block_hash());
-                }
-
+                
                 message::NetworkMessage::Version(version) => {
                     println!("node version is {:?}", version);
                     tx.send(PeerMessage::Message(Message::Verack))?;
@@ -332,10 +336,11 @@ impl Peer {
                 }
 
                 message::NetworkMessage::Inv(invs) => {
-                    for inv in invs {
+                    for inv in &invs {
                         match inv { 
                             Inventory::Transaction(tx) => {
-                                println!("got a tx {:?}", tx);
+                                // println!("got a tx {:?}", tx);
+                                
                             },
                             Inventory::Block(block) => {
                                 println!("got a block {:?}", block);
@@ -345,13 +350,25 @@ impl Peer {
                             }
                         }
                     }
+
+                    tx.send(PeerMessage::Message(Message::GetData(invs)))?;                    
+                }
+
+                message::NetworkMessage::Addr(addrs) => {
+                    for addr in addrs {
+                        // println!("got a new addr {:?}", addr);
+                    }
+                }
+
+                message::NetworkMessage::Pong(nonce) => {
+
                 }
 
                 message::NetworkMessage::Ping(ping) => {
                     tx.send(PeerMessage::Message(Message::Pong(ping)))?;
                 }
                 _ => {
-
+                    println!("command is {}", command);
                 }
             }
         }

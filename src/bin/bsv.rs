@@ -5,7 +5,7 @@ use tokio::time::delay_for;
 use tokio::time::{timeout, Duration};
 
 // use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
-use std::error::Error;
+use std::{error::Error, io::Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::Ipv6Addr;
 use sv::messages::{
@@ -57,6 +57,7 @@ use log4rs::{
     filter::threshold::ThresholdFilter,
 };
 use lru::LruCache;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 
 // mod peer;
 
@@ -118,7 +119,36 @@ impl PeerManager {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {  
-    let mut addrs = HashSet::new(); 
+
+    // let (tx, rx) = std::sync::mpsc::channel();
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    // let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |res| tx.send(res).unwrap())?;
+
+    // Add a path to be watched. All files and directories at that path and
+    // below will be monitored for changes.
+    // watcher.watch("/Users/taoxiaojie/work/wallet/block_syncer/address.txt", RecursiveMode::NonRecursive)?;
+
+    // for res in rx {
+    //     match res {
+    //         Ok(event) => {
+    //                                     use std::fs::File;
+
+    //             if event.kind == EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)) {
+    //                 println!("changed: {:?}", event);
+    //                 for p in event.paths {
+    //                     let mut file = File::open(p)?;
+    //                     let mut contents =  String::new();
+    //                     file.read_to_string(&mut contents)?;
+    //                     println!("content is {:?}", contents);
+    //                 }
+    //             }
+    //         },
+    //         Err(e) => println!("watch error: {:?}", e),
+    //     }
+    // }
+
     // let dir = std::env::current_dir().unwrap();
     // let config_file = dir.join("config.toml");
     
@@ -223,36 +253,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
     }
 
-    let addr_map = Arc::new(RwLock::new(addrs));
-
-    let addr_map_clone = addr_map.clone();
-    // tokio::spawn( async move  {
-    //     let config = redis_config;
-    //     let host = format!("redis://{}:{}/", config.ip.unwrap(), config.port.unwrap());
-
-    //     use redis::{self, AsyncCommands};
-    //     loop {
-    //         let client = redis::Client::open(host.clone()).expect("can not connect to redis server!");
-    //         let mut con = client.get_async_connection().await.unwrap();
-    //         println!("connected to redis server");
-    //         loop {
-    //             match con.brpop::<&str, (String, String)>("threshold_addr_list", 0).await {
-    //                 Ok((k, v)) => {
-    //                     println!("got a new address {:?}", v);
-    //                     let mut lock = addr_map_clone.write().await;
-    //                     (*lock).insert(v);
-    //                 },
-    //                 Err(err) => {
-    //                     println!("redis brpop error {:?}", err);
-    //                     tokio::time::delay_for(std::time::Duration::from_secs(3)).await;
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     }
-    // });
-
-
     let (tx,  mut rx) = unbounded_channel::<NodeAddr>();
     let tx_clone = tx.clone();
     
@@ -330,18 +330,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        let watch_addrs = addr_map.clone();
         let tx_clone = tx.clone();
         let connected_clone = connected.clone();
         let peers_clone = peers.clone();
-        let blocks_clone = blocks.clone();
-        let tx_sender_clone = tx_sender.clone();
+
+        let mut peer = Peer::new(nodeAddr.clone(), tx.clone(), blocks.clone(), tx_sender.clone());
 
         tokio::spawn(async move {
-            let mut peer = Peer::new(nodeAddr.clone(), watch_addrs, tx_clone.clone(), blocks_clone, tx_sender_clone);
+            
             connected_clone.fetch_add(1, Ordering::SeqCst);
 
             peer.connect().await;
+            
             connected_clone.fetch_sub(1, Ordering::SeqCst);
             let mut lock = peers_clone.lock().await;
             println!("connect {:?} error", nodeAddr);

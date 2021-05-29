@@ -6,6 +6,10 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [[bin]]
+name = "test"
+path = "src/bin/test.rs"
+
+[[bin]]
 name = "btc"
 path = "src/bin/btc.rs"
 
@@ -29,6 +33,7 @@ reqwest={ version="0.10", features= ["json"]}
 log4rs="0.12"
 log = "0.4"
 lru="0.6.5"
+notify = "5.0.0-pre.8"
 
 [dependencies.redis]
 version = "*"
